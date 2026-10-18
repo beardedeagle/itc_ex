@@ -1,0 +1,4 @@
+{
+  // Skip files .gitignore excludes (deps/, doc/, _build/).
+  "gitignore": true
+}
