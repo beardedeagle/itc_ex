@@ -8,9 +8,9 @@ defmodule ITC do
     * an **event** tree: the causal history it has seen.
 
   Participants are created with `fork/1` and retired with `join/2`. No
-  globally unique identifiers are needed, and stamp size follows the set of
-  participants that are currently live, not every participant that ever
-  existed.
+  globally unique identifiers are needed. Trees can compact as ownership and
+  history merge; their size also depends on allocation history, tree shape
+  and counter values, even with a fixed number of live participants.
 
       iex> {a, b} = ITC.fork(ITC.seed())
       iex> a = ITC.event(a)
@@ -43,9 +43,15 @@ defmodule ITC do
     * After a fork, keep only the two children and discard the parent.
     * A restarted participant resumes from its last durable stamp, or gets a
       new fork from a live holder. It never seeds again.
+    * Never roll back history or ownership changes already exposed outside
+      the participant. Durably couple stamp updates with published events,
+      acknowledgements and ownership transfers, or recover state that includes
+      those effects before reusing ownership.
     * Reclaim a crashed participant's id (by joining its last durable stamp)
-      only once nothing can still be using that id. Decide the death through
-      consensus and fence the old holder.
+      only if that stamp includes all externally visible changes and nothing
+      can still be using that id. Decide the death through consensus and fence
+      the old holder. Fencing alone neither repairs stale history nor revokes
+      ownership already delegated to live participants.
 
   `join/2` checks for overlapping ids. In a correct system, overlap means one
   of these rules was broken; the usual cause is a zombie still holding an id
@@ -55,14 +61,15 @@ defmodule ITC do
 
   Programmer errors raise, for example recording an event on an anonymous
   stamp or passing an unknown option. Conditions that can come from
-  distributed state return tagged tuples: overlapping ids, and input that
-  fails to decode or validate.
+  distributed state return tagged tuples: overlapping ids, non-anonymous
+  messages passed to `receive_event/2`, and input that fails to decode or
+  validate.
 
   ## Wire formats
 
     * `encode/1` / `decode/2`: External Term Format. Fast on the BEAM.
     * `encode_compact/2` / `decode_compact/2`: the bit encoding from
-      Appendix A of the paper, about 5x smaller and bit-compatible with
+      Appendix A of the paper, bit-compatible with
       `itc:encode/1` and `itc:decode/1` in the Erlang reference
       implementations.
 
@@ -89,6 +96,7 @@ defmodule ITC do
   @typedoc "Causal relation between two stamps' histories."
   @type relation :: :eq | :lt | :gt | :concurrent
 
+  @typedoc "Reason an untrusted wire encoding was rejected by either decoder."
   @type decode_error ::
           :too_large
           | :malformed
@@ -98,6 +106,7 @@ defmodule ITC do
           | :non_canonical
           | :counter_too_large
 
+  @typedoc "Decoder limits on encoded bytes and the largest cumulative event counter."
   @type decode_opt :: {:max_bytes, pos_integer} | {:max_counter, non_neg_integer | :infinity}
 
   @wire_version 1
@@ -153,7 +162,8 @@ defmodule ITC do
   Splits a stamp into two with disjoint ids and the same history.
 
   Discard the input afterwards; keeping it alongside the children duplicates
-  ownership.
+  ownership. An anonymous stamp forks into two anonymous stamps with the same
+  history.
 
       iex> {a, b} = ITC.fork(ITC.seed())
       iex> {ITC.to_tuple(a), ITC.to_tuple(b)}
@@ -175,9 +185,7 @@ defmodule ITC do
       #ITC<1 | 2>
   """
   @spec event(t) :: t
-  def event(%__MODULE__{id: 0}) do
-    raise ArgumentError, "cannot record an event on an anonymous stamp (id 0)"
-  end
+  def event(%__MODULE__{id: 0}), do: raise_anonymous_event()
 
   def event(%__MODULE__{id: id, event: e} = stamp) do
     case Event.fill(id, e) do
@@ -190,9 +198,15 @@ defmodule ITC do
     end
   end
 
+  @spec raise_anonymous_event() :: no_return
+  defp raise_anonymous_event do
+    raise ArgumentError, "cannot record an event on an anonymous stamp (id 0)"
+  end
+
   @doc """
   Merges two stamps: sums their ids and takes the pointwise maximum of their
-  histories.
+  histories. Discard both owning inputs and replace them with the result on
+  success; anonymous inputs carry no ownership and may be reused.
 
   Returns `{:error, :overlapping_ids}` if both stamps own part of the same
   region.
@@ -229,6 +243,8 @@ defmodule ITC do
   @doc """
   Records a send event. Returns `{message_stamp, local_stamp}`; attach
   `message_stamp` to the outgoing message.
+
+  Raises `ArgumentError` if `stamp` is anonymous.
   """
   @spec send_event(t) :: {t, t}
   def send_event(stamp), do: stamp |> event() |> peek()
@@ -236,16 +252,26 @@ defmodule ITC do
   @doc """
   Merges an incoming message stamp into `local`, then records the receive.
 
-  `local` must own a non-zero id.
+  `local` must own a non-zero id, otherwise raises `ArgumentError`.
+  `message` must be anonymous, as returned by `peek/1` or `send_event/1`;
+  otherwise returns `{:error, :non_anonymous_message}`. The returned local
+  stamp retains its id. Use `join/2` or `sync/2` to transfer ownership.
   """
-  @spec receive_event(t, t) :: {:ok, t} | {:error, :overlapping_ids}
-  def receive_event(local, message) do
-    with {:ok, joined} <- join(local, message), do: {:ok, event(joined)}
+  @spec receive_event(t, t) :: {:ok, t} | {:error, :non_anonymous_message}
+  def receive_event(%__MODULE__{id: 0}, %__MODULE__{}), do: raise_anonymous_event()
+
+  def receive_event(%__MODULE__{} = local, %__MODULE__{id: 0} = message) do
+    # An anonymous message owns no region, so the ids cannot overlap.
+    {:ok, joined} = join(local, message)
+    {:ok, event(joined)}
   end
+
+  def receive_event(%__MODULE__{}, %__MODULE__{}), do: {:error, :non_anonymous_message}
 
   @doc """
   Joins two stamps and forks the result. Both come back with the same
   history and with the combined id space split between them.
+  On success, discard the owning inputs and use the two returned stamps.
   """
   @spec sync(t, t) :: {:ok, {t, t}} | {:error, :overlapping_ids}
   def sync(a, b) do
@@ -271,11 +297,10 @@ defmodule ITC do
   def relation(%__MODULE__{event: e}, %__MODULE__{event: e}), do: :eq
 
   def relation(%__MODULE__{event: a}, %__MODULE__{event: b}) do
-    case {Event.leq?(a, b), Event.leq?(b, a)} do
-      {true, true} -> :eq
-      {true, false} -> :lt
-      {false, true} -> :gt
-      {false, false} -> :concurrent
+    cond do
+      Event.leq?(a, b) -> :lt
+      Event.leq?(b, a) -> :gt
+      true -> :concurrent
     end
   end
 
@@ -297,8 +322,8 @@ defmodule ITC do
   @doc """
   Total node count across both trees.
 
-  Useful as a gauge: steady growth usually means id space is leaking from
-  participants that crashed without joining back.
+  A diagnostic gauge, not proof of leaked ownership: supported fork/join
+  churn can deepen trees even with a fixed number of live participants.
   """
   @spec node_count(t) :: pos_integer
   def node_count(%__MODULE__{id: id, event: e}), do: Id.node_count(id) + Event.node_count(e)
@@ -310,9 +335,11 @@ defmodule ITC do
   @doc """
   Encodes a stamp as External Term Format: `{#{@wire_version}, id, event}`.
 
-  The encoding is canonical for a given Erlang/OTP major release. OTP does
-  not promise identical bytes across major releases, so do not persist hashes
-  of these bytes across upgrades; `encode_compact/2` has no such caveat.
+  Canonical validation uses the receiving runtime's encoder. Test byte
+  compatibility across supported OTP versions before a rolling upgrade:
+  differing bytes can be rejected as `:non_canonical`. `encode_compact/2`
+  avoids this dependency on the runtime's ETF encoder. Encoding does not
+  enforce the decoder's byte or counter limits.
 
       iex> ITC.seed() |> ITC.encode() |> ITC.decode()
       {:ok, ITC.seed()}
@@ -325,6 +352,9 @@ defmodule ITC do
   @doc """
   Decodes and validates bytes produced by `encode/1`.
 
+  Input must be a binary; other types are programmer errors. Check the type
+  first if the source does not guarantee it.
+
   Before parsing, the input must fit in `:max_bytes` and start with the
   uncompressed header `encode/1` writes. That rejects compressed terms,
   which would otherwise inflate up to roughly 8000x before validation. The
@@ -332,6 +362,15 @@ defmodule ITC do
   are rejected. Both trees must be normalized, the largest counter must not
   exceed `:max_counter`, and the input must be the canonical encoding of the
   result.
+
+  `:max_bytes` bounds encoded input, not expanded heap or stack use. Choose
+  it together with decode concurrency; deeply nested inputs can expand far
+  beyond their wire size. See `encode/1` for cross-OTP canonicality limits.
+  Finite counter validation compares the tree pointwise with the limit,
+  stopping at the first cumulative counter above it. With the default bound,
+  oversized ETF integers are rejected without propagating them through every
+  ancestor. Very large finite limits can still make arithmetic on cumulative
+  offsets cost tree depth times integer width. `:infinity` skips this check.
 
   ## Options
 
@@ -384,6 +423,7 @@ defmodule ITC do
   binary. With `pad: false` the result is the exact bitstring that
   `itc:encode/1` in the Erlang reference implementations produces, which is
   what `itc:decode/1` there expects.
+  Encoding does not enforce the decoder's byte or counter limits.
 
       iex> ITC.encode_compact(ITC.seed())
       <<0b00110000>>
@@ -391,7 +431,7 @@ defmodule ITC do
       <<0b001::size(3), 0b1000::size(4)>>
   """
   @spec encode_compact(t, pad: boolean) :: bitstring
-  def encode_compact(%__MODULE__{id: id, event: e}, opts \\ []) do
+  def encode_compact(%__MODULE__{id: id, event: e}, opts \\ []) when is_list(opts) do
     bits = Compact.encode(id, e)
     pad? = Keyword.validate!(opts, pad: true)[:pad]
 
@@ -411,11 +451,15 @@ defmodule ITC do
   Decodes and validates bits produced by `encode_compact/2` or by
   `itc:encode/1` in the Erlang reference implementations.
 
+  Input must be a bitstring (including binaries); other types are programmer
+  errors. Check the type first if the source does not guarantee it.
+
   Accepts the exact bitstring, or the bitstring zero-padded to whole bytes.
   Any other trailing bits are rejected, as are non-canonical encodings and
   non-normalized trees. Counters are bounded while parsing, so input made of
   long integer prefixes is rejected in linear time. Takes the same options
   as `decode/2`; `:max_bytes` applies to the size rounded up to whole bytes.
+  Its expanded-memory and large-finite-counter caveats apply here too.
 
       iex> ITC.seed() |> ITC.encode_compact() |> ITC.decode_compact()
       {:ok, ITC.seed()}
@@ -478,7 +522,8 @@ defmodule ITC do
   defp check_counter(_e, :infinity), do: :ok
 
   defp check_counter(e, max) do
-    if Event.max_of(e) <= max, do: :ok, else: {:error, :counter_too_large}
+    # Short-circuit before propagating oversized integers through every ancestor.
+    if Event.leq?(e, max), do: :ok, else: {:error, :counter_too_large}
   end
 
   defp check_canonical(same, same), do: :ok
@@ -488,6 +533,8 @@ end
 defmodule ITC.OverlapError do
   @moduledoc "Raised by `ITC.join!/2` when both stamps own part of the same region."
   defexception [:left, :right]
+
+  @type t :: %__MODULE__{left: ITC.t(), right: ITC.t()}
 
   @impl true
   def message(%{left: left, right: right}) do

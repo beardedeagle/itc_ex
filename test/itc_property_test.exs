@@ -10,7 +10,7 @@ defmodule ITC.PropertyTest do
   @runs 1_000
 
   # ---------------------------------------------------------------------------
-  # Model-based test: random fork / event / join / message traffic, checked
+  # Model-based test: random fork / event / join / send / deliver / sync, checked
   # after every step against a ground-truth oracle. Each replica carries the
   # set of event ids in its causal past; ITC must agree with set inclusion.
   # The same traffic also runs through the paper-literal spec, which must
@@ -19,14 +19,33 @@ defmodule ITC.PropertyTest do
 
   property "stamps track causal history exactly under arbitrary traffic" do
     check all(commands <- list_of(command(), max_length: 80), max_runs: 400) do
-      initial = {[{ITC.seed(), Spec.join({1, 0}, {0, 0}), MapSet.new()}], 0}
-
-      Enum.reduce(commands, initial, fn cmd, state ->
-        state = step(cmd, state)
-        assert_invariants(state)
-        state
-      end)
+      run_model(commands)
     end
+  end
+
+  test "delayed and repeated messages survive sender retirement and sync" do
+    commands = [
+      {:fork, 0},
+      {:send, 0},
+      {:send, 0},
+      {:join, 0, 0},
+      {:fork, 0},
+      {:sync, 0, 0},
+      {:deliver, 0, 0},
+      {:deliver, 1, 1},
+      {:deliver, 0, 1},
+      {:deliver, 1, 1}
+    ]
+
+    run_model(commands)
+  end
+
+  defp run_model(commands) do
+    Enum.reduce(commands, {[{ITC.seed(), {1, 0}, MapSet.new()}], [], 0}, fn cmd, state ->
+      state = step(cmd, state)
+      assert_invariants(state)
+      state
+    end)
   end
 
   defp command do
@@ -34,61 +53,81 @@ defmodule ITC.PropertyTest do
       {4, tuple({constant(:event), non_negative_integer()})},
       {2, tuple({constant(:fork), non_negative_integer()})},
       {2, tuple({constant(:join), non_negative_integer(), non_negative_integer()})},
-      {3, tuple({constant(:message), non_negative_integer(), non_negative_integer()})}
+      {3, tuple({constant(:send), non_negative_integer()})},
+      {3, tuple({constant(:deliver), non_negative_integer(), non_negative_integer()})},
+      {2, tuple({constant(:sync), non_negative_integer(), non_negative_integer()})}
     ])
   end
 
-  defp step({:event, i}, {pool, next}) do
+  defp step({:event, i}, {pool, pending, next}) do
     idx = rem(i, length(pool))
     {stamp, spec, hist} = Enum.at(pool, idx)
     advanced = ITC.event(stamp)
 
     assert ITC.relation(stamp, advanced) == :lt
 
-    {List.replace_at(pool, idx, {advanced, Spec.event(spec), MapSet.put(hist, next)}), next + 1}
+    {List.replace_at(pool, idx, {advanced, Spec.event(spec), MapSet.put(hist, next)}), pending,
+     next + 1}
   end
 
-  defp step({:fork, _i}, {pool, _next} = state) when length(pool) >= @max_replicas, do: state
+  defp step({:fork, _i}, {pool, _pending, _next} = state) when length(pool) >= @max_replicas,
+    do: state
 
-  defp step({:fork, i}, {pool, next}) do
+  defp step({:fork, i}, {pool, pending, next}) do
     idx = rem(i, length(pool))
     {stamp, spec, hist} = Enum.at(pool, idx)
     {a, b} = ITC.fork(stamp)
     {sa, sb} = Spec.fork(spec)
-    {List.replace_at(pool, idx, {a, sa, hist}) ++ [{b, sb, hist}], next}
+    {List.replace_at(pool, idx, {a, sa, hist}) ++ [{b, sb, hist}], pending, next}
   end
 
-  defp step({_two_party, _i, _j}, {[_], _next} = state), do: state
+  defp step({op, _i, _j}, {[_], _pending, _next} = state) when op in [:join, :sync],
+    do: state
 
-  defp step({:join, i, j}, {pool, next}) do
+  defp step({:join, i, j}, {pool, pending, next}) do
     {ia, ib} = distinct_indices(i, j, length(pool))
     {sa, pa, ha} = Enum.at(pool, ia)
     {sb, pb, hb} = Enum.at(pool, ib)
     assert {:ok, joined} = ITC.join(sa, sb)
 
     rest = pool |> List.delete_at(max(ia, ib)) |> List.delete_at(min(ia, ib))
-    {[{joined, Spec.join(pa, pb), MapSet.union(ha, hb)} | rest], next}
+    {[{joined, Spec.join(pa, pb), MapSet.union(ha, hb)} | rest], pending, next}
   end
 
-  defp step({:message, i, j}, {pool, next}) do
-    {from, to} = distinct_indices(i, j, length(pool))
+  defp step({:send, i}, {pool, pending, next}) do
+    from = rem(i, length(pool))
     {sender, ps, hs} = Enum.at(pool, from)
-    {receiver, pr, hr} = Enum.at(pool, to)
-
     {msg, sender} = ITC.send_event(sender)
     hs = MapSet.put(hs, next)
-    assert {:ok, receiver} = ITC.receive_event(receiver, msg)
-    hr = hr |> MapSet.union(hs) |> MapSet.put(next + 1)
-
     {spec_msg, ps} = ps |> Spec.event() |> Spec.peek()
+
+    {List.replace_at(pool, from, {sender, ps, hs}),
+     Enum.take([{msg, spec_msg, hs} | pending], 16), next + 1}
+  end
+
+  defp step({:deliver, _i, _j}, {_pool, [], _next} = state), do: state
+
+  defp step({:deliver, i, j}, {pool, pending, next}) do
+    {msg, spec_msg, hs} = Enum.at(pending, rem(i, length(pending)))
+    to = rem(j, length(pool))
+    {receiver, pr, hr} = Enum.at(pool, to)
+    assert {:ok, receiver} = ITC.receive_event(receiver, msg)
+    hr = hr |> MapSet.union(hs) |> MapSet.put(next)
     pr = pr |> Spec.join(spec_msg) |> Spec.event()
 
-    pool =
-      pool
-      |> List.replace_at(from, {sender, ps, hs})
-      |> List.replace_at(to, {receiver, pr, hr})
+    {List.replace_at(pool, to, {receiver, pr, hr}), pending, next + 1}
+  end
 
-    {pool, next + 2}
+  defp step({:sync, i, j}, {pool, pending, next}) do
+    {ia, ib} = distinct_indices(i, j, length(pool))
+    {a, pa, ha} = Enum.at(pool, ia)
+    {b, pb, hb} = Enum.at(pool, ib)
+    assert {:ok, {a, b}} = ITC.sync(a, b)
+    {pa, pb} = pa |> Spec.join(pb) |> Spec.fork()
+    hist = MapSet.union(ha, hb)
+
+    {pool |> List.replace_at(ia, {a, pa, hist}) |> List.replace_at(ib, {b, pb, hist}), pending,
+     next}
   end
 
   defp distinct_indices(i, j, n) do
@@ -96,7 +135,7 @@ defmodule ITC.PropertyTest do
     {a, rem(a + 1 + rem(j, n - 1), n)}
   end
 
-  defp assert_invariants({pool, _next}) do
+  defp assert_invariants({pool, pending, _next}) do
     stamps = Enum.map(pool, &elem(&1, 0))
 
     # The live ids partition [0, 1) exactly: nothing lost, nothing duplicated.
@@ -112,14 +151,14 @@ defmodule ITC.PropertyTest do
 
     assert total == {:ok, 1}
 
-    for {s, spec, _} <- pool do
+    for {s, spec, _} <- pool ++ pending do
       assert ITC.to_tuple(s) == spec
       assert ITC.valid?(s), "not normalized: #{inspect(s)}"
       assert ITC.decode(ITC.encode(s)) == {:ok, s}
       assert ITC.decode_compact(ITC.encode_compact(s)) == {:ok, s}
     end
 
-    for {sa, _, ha} <- pool, {sb, _, hb} <- pool do
+    for {sa, _, ha} <- pool ++ pending, {sb, _, hb} <- pool ++ pending do
       assert ITC.leq?(sa, sb) == MapSet.subset?(ha, hb),
              "leq?(#{inspect(sa)}, #{inspect(sb)}) disagrees with the oracle"
     end
@@ -198,6 +237,17 @@ defmodule ITC.PropertyTest do
     end
   end
 
+  property "decode/2 never crashes on arbitrary ETF bodies" do
+    check all(body <- binary(max_length: 256), max_runs: @runs) do
+      bin = <<131, 104, 3, 97, 1, body::binary>>
+
+      case ITC.decode(bin) do
+        {:ok, stamp} -> assert ITC.encode(stamp) == bin
+        {:error, reason} -> assert is_atom(reason)
+      end
+    end
+  end
+
   defp trim_padding(bits, stamp) do
     size = bit_size(ITC.encode_compact(stamp, pad: false))
     <<prefix::bitstring-size(^size), _::bitstring>> = bits
@@ -205,7 +255,7 @@ defmodule ITC.PropertyTest do
   end
 
   # ---------------------------------------------------------------------------
-  # Semantic oracles for arbitrary normalized trees. An id is a set of cells
+  # Semantic oracles for arbitrary trees. An id is a set of cells
   # and an event tree is a function over cells; both are expanded to an
   # explicit 2^depth grid and compared cell by cell.
   # ---------------------------------------------------------------------------
@@ -222,6 +272,32 @@ defmodule ITC.PropertyTest do
 
   defp values({n, l, r}, d) do
     Enum.map(values(l, d - 1) ++ values(r, d - 1), &(&1 + n))
+  end
+
+  property "id normalization preserves membership and yields normal form" do
+    raw =
+      Enum.reduce(1..5, member_of([0, 1]), fn _, child ->
+        one_of([member_of([0, 1]), tuple({child, child})])
+      end)
+
+    check all(id <- raw, max_runs: @runs) do
+      normalized = Id.normalize(id)
+      assert Id.normal?(normalized)
+      assert cells(normalized, depth(id)) == cells(id, depth(id))
+    end
+  end
+
+  property "event normalization preserves cell values and yields normal form" do
+    raw =
+      Enum.reduce(1..5, integer(0..4), fn _, child ->
+        one_of([integer(0..4), tuple({integer(0..3), child, child})])
+      end)
+
+    check all(event <- raw, max_runs: @runs) do
+      normalized = Event.normalize(event)
+      assert Event.normal?(normalized)
+      assert values(normalized, depth(event)) == values(event, depth(event))
+    end
   end
 
   property "split yields disjoint halves that sum back to the original" do

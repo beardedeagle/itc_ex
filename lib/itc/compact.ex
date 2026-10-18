@@ -60,19 +60,19 @@ defmodule ITC.Compact do
   # Computing k directly keeps encoding linear in the size of n; the literal
   # recursion does one bignum shift and subtraction per prefix bit, which is
   # quadratic for huge counters.
-  defp number_bits(n, acc) when n < 4, do: <<acc::bitstring, 1::1, 0::1, n::2>>
+  defp number_bits(n, acc) when is_integer(n) and n >= 0 and n < 4,
+    do: <<acc::bitstring, 1::1, 0::1, n::2>>
 
-  defp number_bits(n, acc) do
+  defp number_bits(n, acc) when is_integer(n) and n >= 0 do
     k = bit_length(n + 4) - 3
     width = k + 2
     <<acc::bitstring, 1::1, bsl(1, k) - 1::size(k), 0::1, n + 4 - bsl(1, width)::size(width)>>
   end
 
-  @doc false
   @spec bit_length(pos_integer) :: pos_integer
-  def bit_length(n) when n < 256, do: bits_in_byte(n)
+  defp bit_length(n) when n < 256, do: bits_in_byte(n)
 
-  def bit_length(n) do
+  defp bit_length(n) do
     <<first, _::binary>> = bytes = :binary.encode_unsigned(n)
     8 * (byte_size(bytes) - 1) + bits_in_byte(first)
   end

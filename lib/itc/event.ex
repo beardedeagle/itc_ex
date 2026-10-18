@@ -7,15 +7,15 @@ defmodule ITC.Event do
       described by `r`.
 
   A normalized tree has no `{n, m, m}` node with integer `m`, and in every
-  `{n, l, r}` node at least one child has minimum `0`. Every function here
-  takes normalized trees and returns normalized trees. `min_of/1` relies on
+  `{n, l, r}` node at least one child has minimum `0`. Except for normalization
+  and validation, functions here take normalized trees and return normalized
+  trees. `min_of/1` relies on
   that invariant and reads the base of a node in constant time.
   """
 
   alias ITC.Id
 
   # Same set the reference implementation inlines (lift, drop, base, height).
-  # Worth about 25% on join.
   @compile {:inline, lift: 2, sink: 2, min_of: 1, max_of: 1}
 
   @type t :: non_neg_integer | {non_neg_integer, t, t}
@@ -29,6 +29,8 @@ defmodule ITC.Event do
   Normalizes one node whose children are already normalized.
 
       iex> ITC.Event.norm({2, 1, 1})
+      3
+      iex> ITC.Event.norm(3)
       3
       iex> ITC.Event.norm({2, {2, 1, 0}, 3})
       {4, {0, 1, 0}, 1}

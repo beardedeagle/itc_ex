@@ -6,7 +6,8 @@ defmodule ITC.Id do
     * `1` owns all of it.
     * `{l, r}` splits it into a left and a right half.
 
-  Every function here takes normalized trees and returns normalized trees.
+  Except for normalization and validation, functions here take normalized
+  trees and return normalized trees.
   A normalized tree contains no `{0, 0}` or `{1, 1}` node anywhere. Results
   for anything else are undefined; check untrusted input with `normal?/1`.
   """

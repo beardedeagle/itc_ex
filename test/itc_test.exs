@@ -110,6 +110,11 @@ defmodule ITCTest do
   end
 
   describe "join/2" do
+    test "join!/2 returns the merged stamp on success" do
+      {a, b} = ITC.fork(ITC.seed())
+      assert ITC.to_tuple(ITC.join!(ITC.event(a), b)) == {1, {0, 1, 0}}
+    end
+
     test "rejoining forked halves restores full ownership" do
       {a, b} = ITC.fork(ITC.seed())
       assert {:ok, joined} = ITC.join(ITC.event(a), ITC.event(b))
@@ -172,8 +177,10 @@ defmodule ITCTest do
 
     test "message passing orders sender before receiver" do
       {a, b} = ITC.fork(ITC.seed())
+      {receiver_id, _} = ITC.to_tuple(b)
       {msg, a} = ITC.send_event(a)
       {:ok, b} = ITC.receive_event(b, msg)
+      assert elem(ITC.to_tuple(b), 0) == receiver_id
       assert ITC.relation(a, b) == :lt
       assert ITC.relation(b, a) == :gt
       assert ITC.leq?(a, b)
@@ -184,6 +191,48 @@ defmodule ITCTest do
       {a, b} = ITC.fork(ITC.event(ITC.seed()))
       assert ITC.relation(a, b) == :eq
     end
+  end
+
+  describe "receive_event/2" do
+    test "rejects a disjoint owning message instead of duplicating its id" do
+      {sender, receiver} = ITC.fork(ITC.seed())
+      assert ITC.receive_event(receiver, sender) == {:error, :non_anonymous_message}
+    end
+
+    test "rejects an overlapping owning message" do
+      stamp = ITC.seed()
+      assert ITC.receive_event(stamp, stamp) == {:error, :non_anonymous_message}
+    end
+
+    test "requires local ownership before considering the message" do
+      {anonymous, _} = ITC.peek(ITC.seed())
+
+      for message <- [anonymous, ITC.seed()] do
+        assert_raise ArgumentError, ~r/anonymous/, fn ->
+          ITC.receive_event(anonymous, message)
+        end
+      end
+    end
+
+    test "send_event/1 also requires local ownership" do
+      {anonymous, _} = ITC.peek(ITC.seed())
+      assert_raise ArgumentError, ~r/anonymous/, fn -> ITC.send_event(anonymous) end
+    end
+  end
+
+  test "rolling back a published send reuses its timestamp for a different event" do
+    {checkpoint, receiver} = ITC.fork(ITC.seed())
+    {published, durable_sender} = ITC.send_event(checkpoint)
+    {:ok, receiver} = ITC.receive_event(receiver, published)
+
+    # The library cannot distinguish an application replaying a stale checkpoint.
+    reused = ITC.event(checkpoint)
+    assert ITC.relation(reused, published) == :eq
+    assert ITC.leq?(reused, receiver)
+
+    fresh = ITC.event(durable_sender)
+    assert ITC.relation(published, fresh) == :lt
+    refute ITC.leq?(fresh, receiver)
   end
 
   describe "sync/2" do
@@ -301,6 +350,23 @@ defmodule ITCTest do
       assert ITC.decode(bin, max_counter: 6) |> elem(0) == :ok
     end
 
+    test "rejects a deep oversized ETF counter within a bounded heap" do
+      depth = 5_000
+      leaf = Bitwise.bsl(1, 48 * depth)
+      event = Enum.reduce(1..depth, leaf, fn _, child -> {1, 0, child} end)
+      bin = ITC.encode(stamp!(0, event))
+      assert byte_size(bin) <= 65_536
+
+      # Computing the exact maximum copies the huge leaf at every ancestor.
+      {pid, ref} =
+        spawn_monitor(fn ->
+          Process.flag(:max_heap_size, %{size: 1_000_000, kill: true, error_logger: false})
+          exit({:result, ITC.decode(bin)})
+        end)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:result, {:error, :counter_too_large}}}, 5_000
+    end
+
     test "rejects invalid options" do
       bin = ITC.encode(ITC.seed())
       assert_raise ArgumentError, fn -> ITC.decode(bin, max_bytes: 0) end
@@ -309,7 +375,46 @@ defmodule ITCTest do
     end
   end
 
+  test "both decoders enforce cumulative counter boundaries and preserve infinity" do
+    for {encode, decode} <- [
+          {&ITC.encode/1, &ITC.decode/2},
+          {&ITC.encode_compact/1, &ITC.decode_compact/2}
+        ] do
+      for {event, limit, accepted?} <- [
+            {0, 0, true},
+            {1, 0, false},
+            {5, 5, true},
+            {6, 5, false},
+            {{3, 3, 0}, 6, true},
+            {{3, 3, 0}, 5, false},
+            {{3, 0, 3}, 6, true},
+            {{3, 0, 3}, 5, false},
+            {{2, {1, 0, 2}, 0}, 5, true},
+            {{2, {1, 0, 2}, 0}, 4, false}
+          ] do
+        stamp = stamp!(0, event)
+        bin = encode.(stamp)
+        expected = if accepted?, do: {:ok, stamp}, else: {:error, :counter_too_large}
+        assert decode.(bin, max_counter: limit) == expected
+        assert decode.(bin, max_counter: :infinity) == {:ok, stamp}
+      end
+
+      max = Bitwise.bsl(1, 64) - 1
+      stamp = stamp!(0, max)
+      assert decode.(encode.(stamp), []) == {:ok, stamp}
+      assert decode.(encode.(stamp!(0, max + 1)), []) == {:error, :counter_too_large}
+    end
+  end
+
   describe "encode_compact/2 and decode_compact/2 (paper, appendix A)" do
+    test "rejects negative counters instead of truncating them on the wire" do
+      for n <- [-1, -5], event <- [n, {0, n, 0}, {n, 0, 1}], opts <- [[], [pad: false]] do
+        assert_raise FunctionClauseError, fn ->
+          ITC.encode_compact(%ITC{id: 1, event: event}, opts)
+        end
+      end
+    end
+
     test "matches hand-computed encodings" do
       # enc_i(1) = 001, enc_e(0) = 1 0 00
       assert ITC.encode_compact(ITC.seed(), pad: false) == <<0b001::3, 0b1000::4>>
