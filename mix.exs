@@ -11,7 +11,6 @@ defmodule ITC.MixProject do
       app: :itc_ex,
       version: @version,
       elixir: "~> 1.17",
-      start_permanent: Mix.env() == :prod,
       # Applies to this project only; Mix does not enforce it when the library
       # is compiled as someone else's dependency.
       elixirc_options: [warnings_as_errors: true],
@@ -22,7 +21,6 @@ defmodule ITC.MixProject do
       docs: docs(),
       source_url: @source_url,
       dialyzer: [
-        plt_add_apps: [:ex_unit],
         # :missing_return and :underspecs only report Dialyzer widening the
         # recursive tree types (it cannot prove sums stay non-negative).
         flags: [:error_handling, :extra_return, :unmatched_returns]
@@ -37,7 +35,7 @@ defmodule ITC.MixProject do
 
   defp deps do
     [
-      {:stream_data, "~> 1.4", only: [:dev, :test]},
+      {:stream_data, "~> 1.4", only: :test},
       {:dialyxir, "~> 1.4", only: :dev, runtime: false},
       {:ex_doc, "~> 0.40", only: :dev, runtime: false}
     ]
@@ -47,14 +45,16 @@ defmodule ITC.MixProject do
     [
       name: "itc_ex",
       licenses: ["Apache-2.0"],
+      files: ["lib", "mix.exs", "README.md", "CHANGELOG.md", "LICENSE", ".formatter.exs"],
       links: %{
         "GitHub" => @source_url,
+        "Changelog" => "#{@source_url}/blob/v#{@version}/CHANGELOG.md",
         "Paper" => "https://gsd.di.uminho.pt/members/cbm/ps/itc2008.pdf"
       }
     ]
   end
 
   defp docs do
-    [main: "ITC", extras: ["README.md"], source_ref: "v#{@version}"]
+    [main: "ITC", extras: ["README.md", "CHANGELOG.md"], source_ref: "v#{@version}"]
   end
 end

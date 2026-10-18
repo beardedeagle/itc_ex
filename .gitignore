@@ -15,12 +15,13 @@
 
 # If the VM crashes, it generates a dump, let's ignore it too.
 erl_crash.dump
+/rebar3.crashdump
 
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
 
 # Ignore package tarball (built via "mix hex.build").
-itc_ex-*.tar
+/itc_ex-*.tar
 
 # macOS Finder metadata.
 .DS_Store
@@ -28,5 +29,7 @@ itc_ex-*.tar
 # Elixir language server artifacts.
 .elixir_ls/
 
-# Ignore dialyzer PLT files.
-/priv/
+# Local context-tool indexes.
+/.codegraph/
+/.tgrep/
+/.zvec-grep/
