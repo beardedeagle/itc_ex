@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - elixir: '1.17.0'
+            otp: '27.0.1'
+          - elixir: '1.20.4'
+            otp: '29.0.5'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+        with:
+          elixir-version: ${{ matrix.elixir }}
+          otp-version: ${{ matrix.otp }}
+          version-type: strict
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.mix/*.plt*
+            _build/dev/*.plt*
+          key: plt-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-${{ hashFiles('mix.lock') }}
+          restore-keys: plt-${{ runner.os }}-${{ matrix.otp }}-${{ matrix.elixir }}-
+      - run: mix deps.get
+      - run: mix hex.audit
+      - run: mix deps.unlock --check-unused
+      - run: mix format --check-formatted
+      - run: mix compile --warnings-as-errors
+      - run: mix test --warnings-as-errors
+      - run: npx --yes markdownlint-cli2@0.23.3 README.md CHANGELOG.md
+        if: matrix.elixir == '1.20.4'
+      - run: mix docs --warnings-as-errors
+      - run: mix dialyzer
+      - run: mix hex.build
+      - run: mix run --no-start scripts/check_package.exs
+      - run: mix hex.build --unpack --output _build/package
+      - run: mix compile --warnings-as-errors
+        working-directory: _build/package
+        env:
+          MIX_ENV: prod
