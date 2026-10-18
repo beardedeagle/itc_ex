@@ -6,6 +6,7 @@
 
 # The directory Mix downloads your dependencies sources to.
 /deps/
+/.fetch
 
 # Where third-party dependencies like ExDoc output generated docs.
 /doc/
@@ -19,6 +20,10 @@ erl_crash.dump
 
 # Also ignore archive artifacts (built via "mix archive.build").
 *.ez
+*.beam
+
+# Keep local secrets out of version control.
+/config/*.secret.exs
 
 # Ignore package tarball (built via "mix hex.build").
 /itc_ex-*.tar
